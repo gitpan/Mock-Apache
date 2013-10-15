@@ -1,0 +1,8 @@
+MANIFEST
+Makefile.PL
+MYMETA.json
+lib/Mock/Apache.pm
+t/00-basic.t
+README.md
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
