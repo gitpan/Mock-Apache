@@ -14,12 +14,18 @@ meta-spec:
   version: 1.4
 name: Mock-Apache
 no_index:
-  directory:
-    - t
-    - inc
+  package:
+    - Apache
+    - Apache::Connection
+    - Apache::Constants
+    - Apache::Log
+    - Apache::Server
+    - Apache::Table
+    - Apache::URI
+    - Apache::Util
 requires:
   Apache::FakeTable: 0
   Readonly: 0
   URI: 0
   parent: 0
-version: 0.01
+version: 0.02
