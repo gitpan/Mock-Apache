@@ -1,23 +1,23 @@
 # Mock::Apache - a package to mock the mod_perl 1.x environment
 #
-
 # Method descriptions are taken from my book: "Mod_perl Pocket Reference",
-# Andrew Ford, O'Reilly & Associates, 2001, 0-596-00047-2.  Page references,
-# marked MPPR pNN, refer to the book.
+# Andrew Ford, O'Reilly & Associates, 2001, 0-596-00047-2.
+# Page references in the comments (marked "MPPR pNN") refer to the book.
 #
 # Copyright (C) 2013, Andrew Ford.  All rights reserved.
-# This library is free software; you can redistribute it and/or
-# modify it under the same terms as Perl itself.
+# This library is free software; you can redistribute it and/or modify
+# it under the same terms as Perl itself.
 
 package Mock::Apache;
 
 use strict;
 
 use Apache::ConfigParser;
-use Capture::Tiny qw(capture_stdout);
 use Carp;
+use Cwd;
 use HTTP::Headers;
 use HTTP::Response;
+use IO::Scalar;
 use Module::Loaded;
 use Readonly;
 
@@ -25,16 +25,16 @@ use parent 'Class::Accessor';
 
 __PACKAGE__->mk_accessors(qw(server));
 
-our $VERSION = "0.05";
+our $VERSION = "0.07";
 our $DEBUG;
 
 BEGIN {
 
     Readonly our @APACHE_CLASSES
-	=> qw( Apache  Apache::SubRequest  Apache::Server  Apache::Connection
-               Apache::Log  Apache::Table  Apache::URI  Apache::Util
+        => qw( Apache  Apache::SubRequest  Apache::Server  Apache::Connection
+               Apache::File  Apache::Log  Apache::Table  Apache::URI  Apache::Util
                Apache::Constants  Apache::ModuleConfig  Apache::Symbol
-	       Apache::Request  Apache::Upload  Apache::Cookie );
+               Apache::Request  Apache::Upload  Apache::Cookie );
 
 
     # Lie about the following modules being loaded
@@ -43,41 +43,51 @@ BEGIN {
 
     # alias the DEBUG() function into each class
     sub DEBUG {
-	my ($message, @args) = @_;
+        my ($message, @args) = @_;
 
-	return unless $Mock::Apache::DEBUG;
-	$message .= "\n" unless $message =~ qr{\n$};
-	printf STDERR "DEBUG: $message", @args;
-	if ($DEBUG > 1) {
-	    my ($package, $file, $line, $subr) = ((caller(1))[0..2], (caller(2))[3]);
-	    if ($file eq __FILE__) {
-		($package, $file, $line, $subr) = ((caller(2))[0..2], (caller(3))[3]);
-	    }
-	    print STDERR "       from $subr at line $line of $file\n";
-	}
+        return unless $Mock::Apache::DEBUG;
+        $message .= "\n" unless $message =~ qr{\n$};
+        printf STDERR "DEBUG: $message", @args;
+        if ($DEBUG > 1) {
+            my ($package, $file, $line, $subr) = ((caller(1))[0..2], (caller(2))[3]);
+            if ($file eq __FILE__) {
+                ($package, $file, $line, $subr) = ((caller(2))[0..2], (caller(3))[3]);
+            }
+            my $dir = getcwd;
+            $file =~ s{^$dir/}{};
+            print STDERR "       from $subr at line $line of $file\n";
+        }
 
-	return;
+        return;
     }
 
     sub NYI_DEBUG {
-	my ($message, @args) = @_;
+        my ($message, @args) = @_;
 
-	$message .= "\n" unless $message =~ qr{\n$};
-	printf STDERR "DEBUG: $message", @args;
-	if ($DEBUG > 1) {
-	    my ($package, $file, $line, $subr) = ((caller(1))[0..2], (caller(2))[3]);
-	    if ($file eq __FILE__) {
-		($package, $file, $line, $subr) = ((caller(2))[0..2], (caller(3))[3]);
-	    }
-	    print STDERR "       from $subr at line $line of $file\n";
-	}
-	$DB::single = 1;
-	croak((caller)[3] . " - NOT YET IMPLEMENTED");
+        $message .= "\n" unless $message =~ qr{\n$};
+        printf STDERR "DEBUG: $message", @args;
+
+        my $carp_level = 1;
+        my ($package, $file, $line, $subr) = ((caller(1))[0..2], (caller(2))[3]);
+        if ($file eq __FILE__) {
+            $carp_level++;
+            ($package, $file, $line, $subr) = ((caller(2))[0..2], (caller(3))[3]);
+        }
+        if ($DEBUG > 1) {
+            my $dir = getcwd;
+            $file =~ s{^$dir/}{};
+            print STDERR "       from $subr at line $line of $file";
+        }
+        $DB::single = 1;
+        local $Carp::CarpLevel = $carp_level;
+        croak((caller(1))[3] . " - NOT YET IMPLEMENTED");
     }
 
     no strict 'refs';
     *{"${_}::DEBUG"} = \&DEBUG for @APACHE_CLASSES;
     *{"${_}::NYI_DEBUG"} = \&NYI_DEBUG for @APACHE_CLASSES;
+
+    $ENV{MOD_PERL} = 'CGI-Perl/1.1';
 }
 
 Readonly our $DEFAULT_HOSTNAME => 'server.example.com';
@@ -176,15 +186,30 @@ sub execute_handler {
     local $Apache::request = $request;
 
     my $rc = eval {
-	local $Mock::Apache::DEBUG = $saved_debug;
-	$handler->($request);
+        local $Mock::Apache::DEBUG = $saved_debug;
+        local *STDOUT;
+        tie *STDOUT, 'IO::Scalar', \$request->{_output};
+        $handler->($request);
     };
-    $request->status_line('500 Internal server error')
-	if $@;
+    if ($@) {
+        printf STDERR "handler failed: $@\n";
+        $request->status_line('500 Internal server error');
+    }
 
     my $status  = $request->status;
+    if (!$status) {
+        if ($rc == &Apache::Constants::OK) {
+            $request->status_line(($status = &Apache::Constants::HTTP_OK) . ' ok');
+        }
+        elsif ($rc == &Apache::Constants::MOVED) {
+            $request->status_line(($status = &Apache::Constants::HTTP_MOVED_PERMANENTLY) . ' moved permanently');
+        }
+    }
     (my $message = $request->status_line || '') =~ s/^... //;
     my $headers = HTTP::Headers->new;
+    if (!$request->header_out('content-length')) {
+        $request->header_out('content-length', length($request->_output));
+    }
     while (my($field, $value) = each %{$request->headers_out}) {
         $headers->push_header($field, $value);
     }
@@ -248,11 +273,11 @@ use URI::QueryParam;
 use parent qw(Class::Accessor);
 
 __PACKAGE__->mk_ro_accessors(qw( log
-				 _env
-				 _uri
-				 _mock_client
-				 _output
-			      ));
+                                 _env
+                                 _uri
+                                 _mock_client
+                                 _output
+                              ));
 
 our $server;
 our $request;
@@ -279,6 +304,7 @@ sub _new_request {
                                   connection     => $mock_client->connection,
                                   _mock_client   => $mock_client,
                                   _env           => $env,
+                                  _output        => '',
                                 } );
 
     local $Mock::Apache::DEBUG = 0;
@@ -455,8 +481,8 @@ sub lookup_uri {
 
     our @ISA = qw(Apache);
     sub run {
-	my ($r) = @_;
-	NYI_DEBUG('$r->run');
+        my ($r) = @_;
+        NYI_DEBUG('$r->run');
     }
 }
 
@@ -486,7 +512,7 @@ sub content {
     my ($r) = @_;
     my $content = $r->{content};
     DEBUG('$r->content => %s',
-	  wantarray ? '( \'' . substr($content, 0, 20) . '...\'' : substr($content, 0, 20) . '...');
+          wantarray ? '( \'' . substr($content, 0, 20) . '...\'' : substr($content, 0, 20) . '...');
     return wantarray ? split(qr{\n}, $content) : $content;
 
 }
@@ -495,7 +521,9 @@ sub content {
 sub filename {
     my ($r, $newfilename) = @_;
     my $filename = $r->{filename};
-    DEBUG('$r->filename(%s) => %s', @_ > 1 ? "'$newfilename'" : '', $filename);
+    DEBUG('$r->filename(%s)%s',
+          @_ > 1 ? "'$newfilename'" : '',
+          defined wantarray ? " => $filename" : '');
     $r->{filename} = $newfilename if @_ > 1;
     return $filename;
 }
@@ -606,8 +634,8 @@ sub protocol {
 sub the_request {
     my ($r) = @_;
     my $str = eval {
-	local $Mock::Apache::DEBUG = 0;
-	sprintf("%s %s %s", $r->method, $r->{_uri}, $r->protocol);
+        local $Mock::Apache::DEBUG = 0;
+        sprintf("%s %s %s", $r->method, $r->{_uri}, $r->protocol);
     };
     DEBUG('$r->the_request => \'%s\'', $str);
     return $str;
@@ -650,7 +678,11 @@ sub content_type {
     my ($r, $newval) = @_;
     my $content_type = $r->{content_type};
     DEBUG('$r->content_type(%s) => \'%s\'', @_ > 1 ? "'$newval'" : '', $content_type);
-    $r->{content_type} = $newval if @_ > 1;
+    if (@_ > 1) {
+        $r->{content_type} = $newval;
+        local $Mock::Apache::DEBUG = 0;
+        $r->header_out('content-type' => $newval);
+    }
     return $content_type;
 }
 
@@ -680,8 +712,8 @@ sub status_line   {
     my ($r, $newval) = @_;
     my $status_line = $r->{status_line};
     DEBUG('$r->status_line(%s) => %d', @_ > 1 ? "$newval" : '', $status_line);
-    if (@_) {
-        if (($r->{status_line} = $status_line) =~ m{^(\d\d\d)}x) {
+    if (@_ > 1) {
+        if (($r->{status_line} = $newval) =~ m{^(\d\d\d)}x) {
             $r->status($1);
         }
     }
@@ -693,10 +725,19 @@ sub status_line   {
 sub print {
     my ($r, @list) = @_;
     foreach my $item (@list) {
-        $r->{content} .= ref $item eq 'SCALAR' ? $$item : $item;
+        $r->{_output} .= ref $item eq 'SCALAR' ? $$item : $item;
     }
     return;
 }
+
+# $r->send_http_header([$content_type])                                 MPPR p30
+sub send_http_header{
+    my ($r, $content_type) = @_;
+    DEBUG('$r->send_http_header(%s)', @_ > 1 ? "'$content_type" : '');
+    return;
+}
+
+
 
 # {$str|$href} = $r->notes([$key[,$val]])                               MPPR p31
 # with no arguments returns a reference to the notes table
@@ -731,6 +772,14 @@ sub get_server_port {
     DEBUG('$r->server_port => \'%d\'', $port);
     return $port;
 }
+
+# $r->log_error($message)                                               MPPR p34
+sub log_error {
+    my ($r, $message) = @_;
+    DEBUG('$r->log_error(\%s\')', $message);
+    $r->{log}->error($message);
+}
+
 
 # $s = $r->server                                                       MPPR p38
 # $s = Apache->server
@@ -919,42 +968,41 @@ sub new {
     return bless \%params, $class;
 }
 
-sub log_error {}
 sub log_reason {}
 
 sub warn {
     my $r = shift;
-    print STDERR "WARN: ", @_, "\n";
+    print STDERR "[warn]:  ", @_, "\n";
 }
 
 sub emerg {
     my $r = shift;
-    print STDERR "EMERG: ", @_, "\n";
+    print STDERR "[emerg]: ", @_, "\n";
 }
 
 sub alert {
     my $r = shift;
-    print STDERR "ALERT: ", @_, "\n";
+    print STDERR "[alert]: ", @_, "\n";
 }
 
 sub error {
     my $r = shift;
-    print STDERR "ERROR: ", @_, "\n";
+    print STDERR "[error]: ", @_, "\n";
 }
 
 sub notice {
     my $r = shift;
-    print STDERR "NOTICE: ", @_, "\n";
+    print STDERR "[notice]: ", @_, "\n";
 }
 
 sub info {
     my $r = shift;
-    print STDERR "INFO: ", @_, "\n";
+    print STDERR "[info]: ", @_, "\n";
 }
 
 sub debug {
     my $r = shift;
-    print STDERR "DEBUG: ", @_, "\n";
+    print STDERR "[debug]: ", @_, "\n";
 }
 
 
@@ -966,15 +1014,14 @@ package
     Apache::Table;
 
 use Apache::FakeTable;
-#use Storable qw(freeze thaw);
-use YAML::Syck;
 use parent 'Apache::FakeTable';
 
 sub new {
     my ($class, $r, $allow_refs) = @_;
 
     my $self = $class->SUPER::new($r);
-    $self->{allow_refs} = !!$allow_refs;
+    bless tied(%$self), 'Apache::FakeTableHash::RefsAllowed'
+        if $allow_refs;
     return $self;
 }
 
@@ -983,7 +1030,7 @@ sub _hash_or_list {
 
     my $method_name = (caller(1))[3];
     DEBUG("\$r->$method_name(%s) => %s",
-	  wantarray ? 'list' : $self);
+          wantarray ? 'list' : $self);
 
     if (wantarray) {
         my @values;
@@ -1003,23 +1050,58 @@ sub _get_or_set {
 
     my $method_name = (caller(1))[3];
     my @old_values = $self->get($key);
-    if (@old_values and $self->{allow_refs}) {
-	local $YAML::Syck::LoadBlessed = 1;
-
-	@old_values = (map { ( Load($_) ) } @old_values);
-    }
-    DEBUG("\$r->$method_name('%s'%s) => %s", $key,
-	  @new_values ? join(',', '', @new_values) : '',
-	  @old_values ? join(',', @old_values) : '');
+    DEBUG("\$r->$method_name('%s'%s)%s", $key,
+          @new_values ? join(',', '', @new_values) : '',
+          defined wantarray ? ' => ' . (@old_values ? join(',', @old_values) : "''" ) : '');
     if (@new_values) {
-	if ($self->{allow_refs}) {
-	    @new_values = map { ( Dump($_) ) } @new_values;
-	}
         $self->set($key, @new_values);
     }
     return unless defined wantarray;
     return wantarray ? @old_values : $old_values[0];
 }
+
+# Apache::FakeTableHash always stores values as strings in an array.
+# We need to allow references to be stored (for pnotes), so we rebless
+# the tied hash into our own Apache::FakeTableHash::RefsAllowed class,
+# which is a subclass of Apache::FakeTableHash.
+
+package
+    Apache::FakeTableHash::RefsAllowed;
+
+our @ISA = qw(Apache::FakeTableHash);
+
+sub STORE {
+    my ($self, $key, $value) = @_;
+
+    # Issue a warning if the value is undefined.
+    if (! defined $value and $^W) {
+        require Carp;
+        Carp::carp('Use of uninitialized value in null operation');
+        $value = '';
+    }
+    $self->{lc $key} = [ $key => [$value] ];
+}
+
+sub _add {
+    my ($self, $key, $value) = @_;
+    my $ckey = lc $key;
+
+    if (exists $self->{$ckey}) {
+        # Add it to the array,
+        push @{$self->{$ckey}[1]}, $value;
+    } else {
+        # It's a simple assignment.
+        $self->{$ckey} = [ $key => [$value] ];
+    }
+}
+
+##############################################################################
+#
+# The Apache::File Class                                              MPPR p
+
+package
+    Apache::File;
+
 
 
 ##############################################################################
@@ -1236,6 +1318,7 @@ sub SERVER_BUILT        { "199908" }
 package
     Apache::Request;
 
+use URI::QueryParam;
 use parent 'Apache';
 
 sub new {
@@ -1255,7 +1338,16 @@ sub instance {
 
 sub parse {
     my $apr = shift;
-    NYI_DEBUG('$apr->parse')
+    DEBUG('$apr->parse');
+
+    my $params = $apr->{params} = Apache::Table->new($apr);
+    my $uri = $apr->_uri;
+    foreach my $key ($uri->query_param) {
+        foreach my $value ($uri->query_param($key)) {
+            $params->add($key, $value);
+        }
+    }
+    return;
 }
 
 
@@ -1265,9 +1357,11 @@ sub param {
 }
 
 
-sub params {
-    my $apr = shift;
-    NYI_DEBUG('$apr->params')
+sub parms {
+    my ($apr, $newval) = @_;
+    DEBUG('$apr->parms(%s)', @_ > 1 ? "$newval" : '');
+    $apr->parse unless $apr->{params};
+    return $apr->{params};
 }
 
 sub upload {
@@ -1386,7 +1480,7 @@ Mock::Apache - mock Apache environment for testing and debugging
 =head1 DESCRIPTION
 
 C<Mock::Apache> is a mock framework for testing and debugging mod_perl
-1.x applications.  Although that verson of mod_perl is obsolete, there
+1.x applications.  Although that version of mod_perl is obsolete, there
 is still a lot of legacy code that uses it.  The framework is intended
 to assist in understanding such code, by enabling it to be run and
 debugged outside of the web server environment.  The framework
@@ -1419,6 +1513,38 @@ and minimally "parsing" it.
 localizes elements of the %ENV hash
 
 
+=head1 DEPENDENCIES
+
+=over 4
+
+=item L<Apache::FakeTable>
+
+for emulation of C<Apache::Table> (but this is subclassed to emulate
+pnotes tables, which can store references)
+
+=item L<Module::Loaded>
+
+to pretend that the C<Apache::*> modules are loaded.
+
+=item L<IO::Scalar>
+
+for tieing C<STDOUT> to the Apache response
+
+=back
+
+
+=head1 BUGS AND LIMITATIONS
+
+The intent of this package is to provide an emulation of C<mod_perl>
+1.3 that that will allow straightforward handlers to be unit-tested
+outside the Apache/mod_perl environment.  However it will probably
+never provide perfect emulation.
+
+The package is still in an early alpha stage and is known to be
+incomplete.  Feedback and patches to improve the software are most
+welcome.
+
+
 =head1 SEE ALSO
 
 https://github.com/fordmason/Mock-Apache
@@ -1427,10 +1553,24 @@ I<mod_perl Pocket Reference> by Andrew Ford, O'Reilly & Associates,
 Inc, Sebastapol, 2001, ISBN: 0-596-00047-2
 
 
+=head1 ACKNOWLEDGEMENTS
+
+Inspired by C<Apache::FakeRequest> by Doug MacEachern, with contributions
+from Andrew Ford <andrew@ford-mason.co.uk>.
+
+
 =head1 AUTHORS
 
 Andrew Ford <andrew@ford-mason.co.uk>
 
-Based on C<Apache::FakeRequest> by Doug MacEachern, with contributions
-from Andrew Ford <andrew@ford-mason.co.uk>.
 
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2013 Andrew Ford (<andrew@ford-mason.co.uk>). All rights reserved.
+
+This module is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself. See L<perlartistic>.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
